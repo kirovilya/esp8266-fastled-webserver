@@ -15,25 +15,22 @@
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
-
+#define FASTLED_INTERRUPT_RETRY_COUNT 0
+#define FASTLED_ALLOW_INTERRUPTS 0
+//#define FASTLED_ESP8266_RAW_PIN_ORDER
 #include "FastLED.h"
 FASTLED_USING_NAMESPACE
 
 extern "C" {
 #include "user_interface.h"
 }
-
+#include <ArduinoOTA.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
 #include <FS.h>
 #include <EEPROM.h>
-#include <IRremoteESP8266.h>
 #include "GradientPalettes.h"
-
-#define RECV_PIN 12
-IRrecv irReceiver(RECV_PIN);
-
-#include "Commands.h"
 
 const bool apMode = false;
 
@@ -41,20 +38,33 @@ const bool apMode = false;
 const char WiFiAPPSK[] = "";
 
 // Wi-Fi network to connect to (if not in AP mode)
-const char* ssid = "";
-const char* password = "";
+const char* ssid = "kirov-home";
+const char* password = "kirovilya";
+const char* mdns_hostname = "ledserver";
 
 ESP8266WebServer server(80);
 
-#define DATA_PIN      D8     // for Huzzah: Pins w/o special function:  #4, #5, #12, #13, #14; // #16 does not work :(
-#define LED_TYPE      WS2812
+#define DATA_PIN      D4    
+#define LED_TYPE      WS2812B
 #define COLOR_ORDER   GRB
-#define NUM_LEDS      24
+// Set your number of leds here!
+#define NUM_LEDS      8*15
 
-#define MILLI_AMPS         2000     // IMPORTANT: set here the max milli-Amps of your power supply 5V 2A = 2000
+#define EEPROM_BRIGHTNESS      0
+#define EEPROM_PATTERN      1
+#define EEPROM_SOLID_R      2
+#define EEPROM_SOLID_G      3
+#define EEPROM_SOLID_B      4
+#define EEPROM_PALETTE      5
+#define EEPROM_LIT      6
+#define EEPROM_BIG      7
+
+#define MILLI_AMPS         1500     // IMPORTANT: set here the max milli-Amps of your power supply 5V 2A = 2000
+#define AP_POWER_SAVE 	   1   // Set to 0 if you do not want the access point to shut down after 10 minutes of unuse
 #define FRAMES_PER_SECOND  120 // here you can control the speed. With the Access Point / Web Server the animations run a bit slower.
 
 CRGB leds[NUM_LEDS];
+int lit = NUM_LEDS;
 
 uint8_t patternIndex = 0;
 
@@ -84,18 +94,14 @@ CRGBPalette16 gCurrentPalette( CRGB::Black);
 CRGBPalette16 gTargetPalette( gGradientPalettes[0] );
 
 uint8_t currentPatternIndex = 0; // Index number of which pattern is current
-bool autoplayEnabled = false;
-
-uint8_t autoPlayDurationSeconds = 10;
-unsigned int autoPlayTimeout = 0;
-
 uint8_t currentPaletteIndex = 0;
-
 uint8_t gHue = 0; // rotating "base color" used by many of the patterns
 
-CRGB solidColor = CRGB::Blue;
+CRGB solidColor = CRGB::Black;
 
 uint8_t power = 1;
+uint8_t glitter = 0;
+uint8_t big = 0;  // Activate led 0 as a "special" always lit slightly vibrating led, regardless of pattern
 
 void setup(void) {
   Serial.begin(115200);
@@ -114,8 +120,6 @@ void setup(void) {
   loadSettings();
 
   FastLED.setBrightness(brightness);
-
-  irReceiver.enableIRIn(); // Start the receiver
 
   Serial.println();
   Serial.print( F("Heap: ") ); Serial.println(system_get_free_heap_size());
@@ -138,9 +142,10 @@ void setup(void) {
     }
     Serial.printf("\n");
   }
+  
+  WiFi.hostname(mdns_hostname);
 
-  if (apMode)
-  {
+  if (apMode) {
     WiFi.mode(WIFI_AP);
 
     // Do a little work to get a unique-ish name. Append the
@@ -150,37 +155,42 @@ void setup(void) {
     String macID = String(mac[WL_MAC_ADDR_LENGTH - 2], HEX) +
                    String(mac[WL_MAC_ADDR_LENGTH - 1], HEX);
     macID.toUpperCase();
-    String AP_NameString = "ESP8266 Thing " + macID;
+    String AP_NameString = "Ledserver " + macID;
 
     char AP_NameChar[AP_NameString.length() + 1];
     memset(AP_NameChar, 0, AP_NameString.length() + 1);
 
-    for (int i = 0; i < AP_NameString.length(); i++)
+    for (int i = 0; i < AP_NameString.length(); i++) {
       AP_NameChar[i] = AP_NameString.charAt(i);
+    }
 
     WiFi.softAP(AP_NameChar, WiFiAPPSK);
+    MDNS.begin(mdns_hostname);
+    MDNS.addService("http", "tcp", 80);
 
     Serial.printf("Connect to Wi-Fi access point: %s\n", AP_NameChar);
-    Serial.println("and open http://192.168.4.1 in your browser");
-  }
-  else
-  {
+    Serial.println("and open http://192.168.4.1 or http://" + String(mdns_hostname) + ".local in your browser");
+  } else {
     WiFi.mode(WIFI_STA);
     Serial.printf("Connecting to %s\n", ssid);
     if (String(WiFi.SSID()) != String(ssid)) {
+      Serial.println("I'm not sure what is going on here, but you need this message");
       WiFi.begin(ssid, password);
     }
-
     while (WiFi.status() != WL_CONNECTED) {
       delay(500);
       Serial.print(".");
     }
-
     Serial.print("Connected! Open http://");
     Serial.print(WiFi.localIP());
     Serial.println(" in your browser");
   }
 
+  ArduinoOTA.onStart([]() {});
+  ArduinoOTA.onEnd([]() {});
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {});
+  ArduinoOTA.onError([](ota_error_t error) {});
+  ArduinoOTA.begin();
   //  server.serveStatic("/", SPIFFS, "/index.htm"); // ,"max-age=86400"
 
   server.on("/all", HTTP_GET, []() {
@@ -191,10 +201,30 @@ void setup(void) {
     sendPower();
   });
 
+  server.on("/glitter", HTTP_GET, []() {
+    sendGlitter();
+  });
+
+  server.on("/big", HTTP_GET, []() {
+    sendBig();
+  });
+  
   server.on("/power", HTTP_POST, []() {
     String value = server.arg("value");
     setPower(value.toInt());
     sendPower();
+  });
+
+  server.on("/glitter", HTTP_POST, []() {
+    String value = server.arg("value");
+    setGlitter(value.toInt());
+    sendGlitter();
+  });
+
+  server.on("/big", HTTP_POST, []() {
+    String value = server.arg("value");
+    setBig(value.toInt());
+    sendBig();
   });
 
   server.on("/solidColor", HTTP_GET, []() {
@@ -218,15 +248,11 @@ void setup(void) {
     setPattern(value.toInt());
     sendPattern();
   });
-
-  server.on("/patternUp", HTTP_POST, []() {
-    adjustPattern(true);
-    sendPattern();
-  });
-
-  server.on("/patternDown", HTTP_POST, []() {
-    adjustPattern(false);
-    sendPattern();
+  
+  server.on("/lit", HTTP_POST, []() {
+    String value = server.arg("value");
+    setLit(value.toInt());
+    sendLit();
   });
 
   server.on("/brightness", HTTP_GET, []() {
@@ -236,16 +262,6 @@ void setup(void) {
   server.on("/brightness", HTTP_POST, []() {
     String value = server.arg("value");
     setBrightness(value.toInt());
-    sendBrightness();
-  });
-
-  server.on("/brightnessUp", HTTP_POST, []() {
-    adjustBrightness(true);
-    sendBrightness();
-  });
-
-  server.on("/brightnessDown", HTTP_POST, []() {
-    adjustBrightness(false);
     sendBrightness();
   });
 
@@ -269,8 +285,6 @@ void setup(void) {
   server.begin();
 
   Serial.println("HTTP server started");
-
-  autoPlayTimeout = millis() + (autoPlayDurationSeconds * 1000);
 }
 
 typedef void (*Pattern)();
@@ -291,6 +305,8 @@ PatternAndNameList patterns = {
   { sinelon, "Sinelon" },
   { juggle, "Juggle" },
   { bpm, "BPM" },
+  { jozef, "Jozef's pattern" },
+  { police, "Da Police" },  
   { showSolidColor, "Solid Color" },
 };
 
@@ -327,12 +343,11 @@ const String paletteNames[paletteCount] = {
 };
 
 void loop(void) {
+  ArduinoOTA.handle();
   // Add entropy to random number generator; we use a lot of it.
   random16_add_entropy(random(65535));
 
   server.handleClient();
-
-  handleIrInput();
 
   if (power == 0) {
     fill_solid(leds, NUM_LEDS, CRGB::Black);
@@ -340,10 +355,6 @@ void loop(void) {
     FastLED.delay(15);
     return;
   }
-
-  // EVERY_N_SECONDS(10) {
-  //   Serial.print( F("Heap: ") ); Serial.println(system_get_free_heap_size());
-  // }
 
   EVERY_N_MILLISECONDS( 20 ) {
     gHue++;  // slowly cycle the "base color" through the rainbow
@@ -360,13 +371,26 @@ void loop(void) {
     nblendPaletteTowardPalette( gCurrentPalette, gTargetPalette, 16);
   }
 
-  if (autoplayEnabled && millis() > autoPlayTimeout) {
-    adjustPattern(true);
-    autoPlayTimeout = millis() + (autoPlayDurationSeconds * 1000);
+  
+  EVERY_N_SECONDS( 600 ) {
+    if(apMode && wifi_softap_get_station_num() == 0 && AP_POWER_SAVE) {
+      WiFi.forceSleepBegin();
+      Serial.println("Modem is sleeping now");
+    }
   }
-
+  
   // Call the current pattern function once, updating the 'leds' array
   patterns[currentPatternIndex].pattern();
+
+  if(glitter) {
+    addGlitter(3);
+  }
+  
+  // If the big led (led 0) is activated
+  if(big == 1) {
+    leds[0] = CHSV(0,random(0,50),255);
+  }
+
 
   FastLED.show();
 
@@ -374,226 +398,20 @@ void loop(void) {
   FastLED.delay(1000 / FRAMES_PER_SECOND);
 }
 
-void handleIrInput()
-{
-  InputCommand command = readCommand(defaultHoldDelay);
-
-  if (command != InputCommand::None) {
-    Serial.print("command: ");
-    Serial.println((int) command);
-  }
-
-  switch (command) {
-    case InputCommand::Up: {
-        adjustPattern(true);
-        break;
-      }
-    case InputCommand::Down: {
-        adjustPattern(false);
-        break;
-      }
-    case InputCommand::Power: {
-        power = power == 0 ? 1 : 0;
-        break;
-      }
-    case InputCommand::BrightnessUp: {
-        adjustBrightness(true);
-        break;
-      }
-    case InputCommand::BrightnessDown: {
-        adjustBrightness(false);
-        break;
-      }
-    case InputCommand::PlayMode: { // toggle pause/play
-        autoplayEnabled = !autoplayEnabled;
-        break;
-      }
-
-    // pattern buttons
-
-    case InputCommand::Pattern1: {
-        setPattern(0);
-        break;
-      }
-    case InputCommand::Pattern2: {
-        setPattern(1);
-        break;
-      }
-    case InputCommand::Pattern3: {
-        setPattern(2);
-        break;
-      }
-    case InputCommand::Pattern4: {
-        setPattern(3);
-        break;
-      }
-    case InputCommand::Pattern5: {
-        setPattern(4);
-        break;
-      }
-    case InputCommand::Pattern6: {
-        setPattern(5);
-        break;
-      }
-    case InputCommand::Pattern7: {
-        setPattern(6);
-        break;
-      }
-    case InputCommand::Pattern8: {
-        setPattern(7);
-        break;
-      }
-    case InputCommand::Pattern9: {
-        setPattern(8);
-        break;
-      }
-    case InputCommand::Pattern10: {
-        setPattern(9);
-        break;
-      }
-    case InputCommand::Pattern11: {
-        setPattern(10);
-        break;
-      }
-    case InputCommand::Pattern12: {
-        setPattern(11);
-        break;
-      }
-
-    // custom color adjustment buttons
-
-    case InputCommand::RedUp: {
-        solidColor.red += 8;
-        setSolidColor(solidColor);
-        break;
-      }
-    case InputCommand::RedDown: {
-        solidColor.red -= 8;
-        setSolidColor(solidColor);
-        break;
-      }
-    case InputCommand::GreenUp: {
-        solidColor.green += 8;
-        setSolidColor(solidColor);
-        break;
-      }
-    case InputCommand::GreenDown: {
-        solidColor.green -= 8;
-        setSolidColor(solidColor);
-        break;
-      }
-    case InputCommand::BlueUp: {
-        solidColor.blue += 8;
-        setSolidColor(solidColor);
-        break;
-      }
-    case InputCommand::BlueDown: {
-        solidColor.blue -= 8;
-        setSolidColor(solidColor);
-        break;
-      }
-
-    // color buttons
-
-    case InputCommand::Red: {
-        setSolidColor(CRGB::Red);
-        break;
-      }
-    case InputCommand::RedOrange: {
-        setSolidColor(CRGB::OrangeRed);
-        break;
-      }
-    case InputCommand::Orange: {
-        setSolidColor(CRGB::Orange);
-        break;
-      }
-    case InputCommand::YellowOrange: {
-        setSolidColor(CRGB::Goldenrod);
-        break;
-      }
-    case InputCommand::Yellow: {
-        setSolidColor(CRGB::Yellow);
-        break;
-      }
-
-    case InputCommand::Green: {
-        setSolidColor(CRGB::Green);
-        break;
-      }
-    case InputCommand::Lime: {
-        setSolidColor(CRGB::Lime);
-        break;
-      }
-    case InputCommand::Aqua: {
-        setSolidColor(CRGB::Aqua);
-        break;
-      }
-    case InputCommand::Teal: {
-        setSolidColor(CRGB::Teal);
-        break;
-      }
-    case InputCommand::Navy: {
-        setSolidColor(CRGB::Navy);
-        break;
-      }
-
-    case InputCommand::Blue: {
-        setSolidColor(CRGB::Blue);
-        break;
-      }
-    case InputCommand::RoyalBlue: {
-        setSolidColor(CRGB::RoyalBlue);
-        break;
-      }
-    case InputCommand::Purple: {
-        setSolidColor(CRGB::Purple);
-        break;
-      }
-    case InputCommand::Indigo: {
-        setSolidColor(CRGB::Indigo);
-        break;
-      }
-    case InputCommand::Magenta: {
-        setSolidColor(CRGB::Magenta);
-        break;
-      }
-
-    case InputCommand::White: {
-        setSolidColor(CRGB::White);
-        break;
-      }
-    case InputCommand::Pink: {
-        setSolidColor(CRGB::Pink);
-        break;
-      }
-    case InputCommand::LightPink: {
-        setSolidColor(CRGB::LightPink);
-        break;
-      }
-    case InputCommand::BabyBlue: {
-        setSolidColor(CRGB::CornflowerBlue);
-        break;
-      }
-    case InputCommand::LightBlue: {
-        setSolidColor(CRGB::LightBlue);
-        break;
-      }
-  }
-}
 
 void loadSettings()
 {
-  brightness = EEPROM.read(0);
+  brightness = EEPROM.read(EEPROM_BRIGHTNESS);
 
-  currentPatternIndex = EEPROM.read(1);
+  currentPatternIndex = EEPROM.read(EEPROM_PATTERN);
   if (currentPatternIndex < 0)
     currentPatternIndex = 0;
   else if (currentPatternIndex >= patternCount)
     currentPatternIndex = patternCount - 1;
 
-  byte r = EEPROM.read(2);
-  byte g = EEPROM.read(3);
-  byte b = EEPROM.read(4);
+  byte r = EEPROM.read(EEPROM_SOLID_R);
+  byte g = EEPROM.read(EEPROM_SOLID_G);
+  byte b = EEPROM.read(EEPROM_SOLID_B);
 
   if (r == 0 && g == 0 && b == 0)
   {
@@ -603,18 +421,24 @@ void loadSettings()
     solidColor = CRGB(r, g, b);
   }
 
-  currentPaletteIndex = EEPROM.read(5);
+  currentPaletteIndex = EEPROM.read(EEPROM_PALETTE);
   if (currentPaletteIndex < 0)
     currentPaletteIndex = 0;
   else if (currentPaletteIndex >= paletteCount)
     currentPaletteIndex = paletteCount - 1;
-}
+  big = EEPROM.read(EEPROM_BIG);
+  lit = _min(EEPROM.read(EEPROM_LIT), NUM_LEDS);
+ }
 
 void sendAll()
 {
   String json = "{";
 
   json += "\"power\":" + String(power) + ",";
+  json += "\"glitter\":" + String(glitter) + ",";
+  json += "\"big\":" + String(big) + ",";
+  json += "\"lit\":" + String(lit) + ",";
+  json += "\"numleds\":" + String(NUM_LEDS) + ",";
   json += "\"brightness\":" + String(brightness) + ",";
 
   json += "\"currentPattern\":{";
@@ -662,6 +486,27 @@ void sendPower()
   json = String();
 }
 
+void sendGlitter()
+{
+  String json = String(glitter);
+  server.send(200, "text/json", json);
+  json = String();
+}
+
+void sendBig()
+{
+  String json = String(big);
+  server.send(200, "text/json", json);
+  json = String();
+}
+
+void sendLit()
+{
+  String json = String(lit);
+  server.send(200, "text/json", json);
+  json = String();
+}
+
 void sendPattern()
 {
   String json = "{";
@@ -705,6 +550,26 @@ void setPower(uint8_t value)
   power = value == 0 ? 0 : 1;
 }
 
+void setGlitter(uint8_t value)
+{
+  glitter = value == 0 ? 0 : 1;
+}
+
+void setBig(uint8_t value)
+{
+  big = value == 0 ? 0 : 1;
+  Serial.println("Writing big " + big);
+  EEPROM.write(EEPROM_BIG, big);
+  EEPROM.commit();
+}
+
+void setLit(int value) {
+  lit = _min(value, NUM_LEDS);
+  Serial.println("Writing " + lit);
+  EEPROM.write(EEPROM_LIT, lit);
+  EEPROM.commit();
+}
+
 void setSolidColor(CRGB color)
 {
   setSolidColor(color.r, color.g, color.b);
@@ -714,82 +579,38 @@ void setSolidColor(uint8_t r, uint8_t g, uint8_t b)
 {
   solidColor = CRGB(r, g, b);
 
-  EEPROM.write(2, r);
-  EEPROM.write(3, g);
-  EEPROM.write(4, b);
+  EEPROM.write(EEPROM_SOLID_R, r);
+  EEPROM.write(EEPROM_SOLID_G, g);
+  EEPROM.write(EEPROM_SOLID_B, b);
 
   setPattern(patternCount - 1);
-}
-
-// increase or decrease the current pattern number, and wrap around at the ends
-void adjustPattern(bool up)
-{
-  if (up)
-    currentPatternIndex++;
-  else
-    currentPatternIndex--;
-
-  // wrap around at the ends
-  if (currentPatternIndex < 0)
-    currentPatternIndex = patternCount - 1;
-  if (currentPatternIndex >= patternCount)
-    currentPatternIndex = 0;
-
-  if (autoplayEnabled) {
-    EEPROM.write(1, currentPatternIndex);
-    EEPROM.commit();
-  }
 }
 
 void setPattern(int value)
 {
   // don't wrap around at the ends
-  if (value < 0)
+  if (value < 0) {
     value = 0;
-  else if (value >= patternCount)
+  } else if (value >= patternCount) {
     value = patternCount - 1;
-
-  currentPatternIndex = value;
-
-  if (autoplayEnabled == 0) {
-    EEPROM.write(1, currentPatternIndex);
-    EEPROM.commit();
   }
+  currentPatternIndex = value;
+  EEPROM.write(EEPROM_PATTERN, currentPatternIndex);
+  EEPROM.commit();
 }
 
 void setPalette(int value)
 {
   // don't wrap around at the ends
-  if (value < 0)
+  if (value < 0) {
     value = 0;
-  else if (value >= paletteCount)
+  } else if (value >= paletteCount) {
     value = paletteCount - 1;
+  }
 
   currentPaletteIndex = value;
 
-  EEPROM.write(5, currentPaletteIndex);
-  EEPROM.commit();
-}
-
-// adjust the brightness, and wrap around at the ends
-void adjustBrightness(bool up)
-{
-  if (up)
-    brightnessIndex++;
-  else
-    brightnessIndex--;
-
-  // wrap around at the ends
-  if (brightnessIndex < 0)
-    brightnessIndex = brightnessCount - 1;
-  else if (brightnessIndex >= brightnessCount)
-    brightnessIndex = 0;
-
-  brightness = brightnessMap[brightnessIndex];
-
-  FastLED.setBrightness(brightness);
-
-  EEPROM.write(0, brightness);
+  EEPROM.write(EEPROM_PALETTE, currentPaletteIndex);
   EEPROM.commit();
 }
 
@@ -804,19 +625,19 @@ void setBrightness(int value)
 
   FastLED.setBrightness(brightness);
 
-  EEPROM.write(0, brightness);
+  EEPROM.write(EEPROM_BRIGHTNESS, brightness);
   EEPROM.commit();
 }
 
 void showSolidColor()
 {
-  fill_solid(leds, NUM_LEDS, solidColor);
+  fill_solid(leds, lit, solidColor);
 }
 
 void rainbow()
 {
   // FastLED's built-in rainbow generator
-  fill_rainbow( leds, NUM_LEDS, gHue, 10);
+  fill_rainbow( leds, lit, gHue, 10);
 }
 
 void rainbowWithGlitter()
@@ -829,7 +650,8 @@ void rainbowWithGlitter()
 void addGlitter( fract8 chanceOfGlitter)
 {
   if ( random8() < chanceOfGlitter) {
-    leds[ random16(NUM_LEDS) ] += CRGB::White;
+    int randomed = random16(lit);
+    leds[randomed] += CRGB::White;
   }
 }
 
@@ -837,7 +659,7 @@ void confetti()
 {
   // random colored speckles that blink in and fade smoothly
   fadeToBlackBy( leds, NUM_LEDS, 10);
-  int pos = random16(NUM_LEDS);
+  int pos = random16(lit);
   //  leds[pos] += CHSV( gHue + random8(64), 200, 255);
   leds[pos] += ColorFromPalette(palettes[currentPaletteIndex], gHue + random8(64));
 }
@@ -846,9 +668,46 @@ void sinelon()
 {
   // a colored dot sweeping back and forth, with fading trails
   fadeToBlackBy( leds, NUM_LEDS, 20);
-  int pos = beatsin16(13, 0, NUM_LEDS - 1);
-  //  leds[pos] += CHSV( gHue, 255, 192);
-  leds[pos] += ColorFromPalette(palettes[currentPaletteIndex], gHue, 192);
+  if(lit > 2) {
+    int pos = beatsin16(13, 0, lit - 1);
+    //  leds[pos] += CHSV( gHue, 255, 192);
+    leds[pos] += ColorFromPalette(palettes[currentPaletteIndex], gHue, 192);
+  }
+}
+
+
+// Pattern made for someone named Jozef. This pattern slowly lights and fades random 
+// numbers of leds
+void jozef() {
+  static int led_duration[NUM_LEDS];
+  static CRGBPalette16 led_hue[NUM_LEDS];
+  static int led_sat[NUM_LEDS];
+
+  // This value sets how long leds remain lit, approximately. A random deviation is added
+  // at each iteration
+  static int DURATION = 550;
+  
+  // How often leds trigger. Higher = more often. Note that every iteration only triggers 
+  // ONE led, irregardless of how many leds you have. If you want more you should rewrite 
+  // this function to random a duration for every led. 
+  static int FREQ_INV = 600;
+  
+  int a = random(FREQ_INV);
+  if (a < lit && led_duration[a] == 0) {
+    led_duration[a] = random(DURATION - (DURATION / 10), DURATION  + (DURATION / 10));
+    led_sat[a] = gHue;
+    led_hue[a] = palettes[currentPaletteIndex];
+  }
+
+  for(int i = 0; i < lit; i++) {
+    if(led_duration[i]  > 0) {
+      int bri = constrain(led_duration[i] > 255 ? DURATION - led_duration[i] : led_duration[i], 0, brightness);
+      leds[i] = ColorFromPalette(led_hue[i], led_sat[i], bri);
+      --led_duration[i];
+    } else {
+        leds[i] = CRGB::Black; 
+    }
+  }
 }
 
 void bpm()
@@ -857,7 +716,7 @@ void bpm()
   uint8_t BeatsPerMinute = 62;
   CRGBPalette16 palette = palettes[currentPaletteIndex];
   uint8_t beat = beatsin8( BeatsPerMinute, 64, 255);
-  for ( int i = 0; i < NUM_LEDS; i++) { //9948
+  for ( int i = 0; i < NUM_LEDS && i < lit; i++) { //9948
     leds[i] = ColorFromPalette(palette, gHue + (i * 2), beat - gHue + (i * 10));
   }
 }
@@ -865,12 +724,12 @@ void bpm()
 void juggle()
 {
   // eight colored dots, weaving in and out of sync with each other
-  fadeToBlackBy( leds, NUM_LEDS, 20);
+  fadeToBlackBy( leds, lit, 20);
   byte dothue = 0;
   for ( int i = 0; i < 8; i++)
   {
     //    leds[beatsin16(i + 7, 0, NUM_LEDS)] |= CHSV(dothue, 200, 255);
-    leds[beatsin16(i + 7, 0, NUM_LEDS)] |= ColorFromPalette(palettes[currentPaletteIndex], dothue);
+    leds[beatsin16(i + 7, 0, lit)] |= ColorFromPalette(palettes[currentPaletteIndex], dothue);
     dothue += 32;
   }
 }
@@ -898,7 +757,7 @@ void pride() {
   sHue16 += deltams * beatsin88( 400, 5, 9);
   uint16_t brightnesstheta16 = sPseudotime;
 
-  for ( uint16_t i = 0 ; i < NUM_LEDS; i++) {
+  for ( uint16_t i = 0 ; i < lit; i++) {
     hue16 += hueinc16;
     uint8_t hue8 = hue16 / 256;
 
@@ -939,7 +798,7 @@ void colorwaves()
   sHue16 += deltams * beatsin88( 400, 5, 9);
   uint16_t brightnesstheta16 = sPseudotime;
 
-  for ( uint16_t i = 0 ; i < NUM_LEDS; i++) {
+  for ( uint16_t i = 0 ; i < lit; i++) {
     hue16 += hueinc16;
     uint8_t hue8 = hue16 / 256;
     uint16_t h16_128 = hue16 >> 7;
@@ -964,6 +823,54 @@ void colorwaves()
 
     nblend(leds[i], newcolor, 128);
   }
+}
+
+void police() {
+	static int colorstep = 0;
+	static int flip = 1;
+	static uint16_t reds[NUM_LEDS];
+	static uint16_t init = 0;
+
+	// This ugly amount of code is to get my leds in alternating reds and blues, 
+	// I'm pretty sure there is a better way by bitshifting or such. 
+	// This codes generates an array of alternating ones and zeroes. 
+	if(init == 0) {
+		for ( uint16_t i = 0 ; i < NUM_LEDS; i++) {
+		  if(i % 2 == 1) { 
+  			reds[i] = 1;
+		  }
+		}
+		init = 1;
+	}
+  
+    // We use 4x flip so the brightness ramps up a lot faster    
+	colorstep = colorstep + (4 * flip);
+	
+	// If we hit boundaries, start powering the leds down
+	if(colorstep >= 255) {
+  	colorstep = 255;
+		flip = -1;
+    // And if the led is powered down, switch colors
+	} else if (colorstep <= 0){
+  	colorstep = 0;
+		flip = 1;
+		// Flip reds and blues
+		for ( uint16_t i = 0 ; i < NUM_LEDS; i++) {
+		  reds[i] = (reds[i] == 1 ? 0 : 1);
+		}
+	}
+
+	// Actually color the leds
+	for ( uint16_t i = 0 ; i < lit; i++) {
+	    // ..if this led is red
+		if(reds[i]) {
+			leds[i] = CRGB(colorstep, 0, 0);
+		// ..if this led is blue
+		} else {
+			leds[i] = CRGB(0, 0, colorstep);
+		}
+	}
+	FastLED.setBrightness(brightness);
 }
 
 // Alternate rendering function just scrolls the current palette
